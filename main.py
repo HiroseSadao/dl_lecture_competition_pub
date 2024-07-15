@@ -63,7 +63,7 @@ def process_text(text):
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
-    def __init__(self, df_path, image_dir, transform=None, answer=True):
+    def __init__(self, df_path, image_dir, embedding_dim=3909, transform=None, answer=True):
         self.transform = transform  # 画像の前処理
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
         self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
@@ -93,6 +93,10 @@ class VQADataset(torch.utils.data.Dataset):
                     if word not in self.answer2idx:
                         self.answer2idx[word] = len(self.answer2idx)
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
+    
+        # ランダムに単語の埋め込みベクトルを作成（通常は事前学習済みの埋め込みを使用）
+        self.embedding_dim = embedding_dim # ベクトルの次元数
+        self.word_embeddings = {word: np.random.randn(self.embedding_dim) for word in self.question2idx.keys()}
 
     def update_dict(self, dataset):
         """
@@ -121,8 +125,8 @@ class VQADataset(torch.utils.data.Dataset):
         -------
         image : torch.Tensor  (C, H, W)
             画像データ
-        question : torch.Tensor  (vocab_size)
-            質問文をone-hot表現に変換したもの
+        question : torch.Tensor (embedding_dim)
+            質問文をベクトル表現に変換したもの
         answers : torch.Tensor  (n_answer)
             10人の回答者の回答のid
         mode_answer_idx : torch.Tensor  (1)
@@ -130,13 +134,12 @@ class VQADataset(torch.utils.data.Dataset):
         """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
+        question = np.zeros(self.embedding_dim) # 質問文を連続ベクトルに変換
         question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
+        valid_words = [self.word_embeddings[word] for word in question_words if word in self.word_embeddings]
+
+        if valid_words:
+            question = np.mean(valid_words, axis=0)  # 有効な単語のベクトルの平均を取る
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
@@ -364,26 +367,32 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # dataloader / model
-    transform = transforms.Compose([
+    base_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+#         transforms.ToTensor(),
+        transforms.Compose([transforms.ToTensor(), transforms.RandomErasing(p=0.8, scale=(0.02, 0.33), ratio=(0.3, 3.3)),]) # random erasing
+    ])
+    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=train_transform, embedding_dim=3909)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=base_transform, answer=False, embedding_dim=3909)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+#     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 2
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
     # train model
     for epoch in range(num_epoch):
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
         print(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
